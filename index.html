@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Route Resilience Dashboard</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; font-family: Arial, sans-serif; }
+        #header { background: #222; color: white; padding: 10px 20px; }
+        #container { display: flex; height: calc(100vh - 60px); }
+        #map { flex: 3; height: 100%; min-height: 500px; background: #333; }
+        #sidebar { flex: 1; background: #f4f4f4; padding: 20px; overflow-y: auto; min-width: 280px; }
+        select, button { width: 100%; padding: 8px; margin: 6px 0; }
+        button { background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #uploadBtn { background: #28a745; }
+        #uploadBtn:hover { background: #1e7e34; }
+        .metric { background: white; padding: 10px; margin: 8px 0; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .metric span { font-weight: bold; color: #007bff; }
+        .error { color: red; white-space: pre-wrap; }
+        .debug { font-size: 12px; color: #555; margin-top: 20px; border-top: 1px solid #ccc; padding-top: 10px; max-height: 200px; overflow-y: auto; }
+        .legend {
+            background: rgba(255,255,255,0.95);
+            padding: 12px 16px;
+            border-radius: 6px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            max-height: 90vh;
+            overflow-y: auto;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .legend label { display: block; margin: 3px 0; }
+        .legend hr { margin: 8px 0; border: 0; border-top: 1px solid #ddd; }
+        .legend .color-bar { display: inline-block; width: 18px; height: 18px; vertical-align: middle; margin-right: 4px; }
+        .node-label {
+            font-weight: bold;
+            font-size: 11px;
+            color: white;
+            text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;
+            background: rgba(0,0,0,0.55);
+            padding: 2px 4px;
+            border-radius: 3px;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .edge-weight {
+            font-size: 10px;
+            color: #222;
+            background: rgba(255,255,255,0.8);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: bold;
+            border: 1px solid #888;
+            pointer-events: none;
+        }
+        #uploadSection {
+            margin-bottom: 15px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 10px;
+        }
+        #uploadStatus {
+            margin-top: 6px;
+            font-size: 13px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>🚦 Route Resilience – Interactive Map</h1>
+    </div>
+    <div id="container">
+        <div id="map"></div>
+        <div id="sidebar">
+            <!-- UPLOAD SECTION -->
+            <div id="uploadSection">
+                <h3>Upload New Image</h3>
+                <input type="file" id="fileInput" accept="image/*" style="margin-bottom:6px;">
+                <button id="uploadBtn">Process</button>
+                <div id="uploadStatus"></div>
+            </div>
+
+            <h3>Simulation Controls</h3>
+            <label>Start node</label>
+            <select id="startSelect"></select>
+            <label>End node</label>
+            <select id="endSelect"></select>
+            <label>Closed nodes (hold Ctrl to select multiple)</label>
+            <select id="closedSelect" multiple></select>
+            <button id="simulateBtn">Run Simulation</button>
+            <div id="results">
+                <h4>Results</h4>
+                <div id="metrics"></div>
+                <div id="errorMsg" class="error"></div>
+                <div id="debug" class="debug"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let map, graphData, routeLayer = null;
+        let edgeGroup = L.layerGroup();
+        let nodeGroup = L.layerGroup();
+        let labelGroup = L.layerGroup();
+        let edgeLabelGroup = L.layerGroup();
+        let satOverlay, maskOverlay;
+
+        const debug = document.getElementById('debug');
+
+        function log(msg) {
+            debug.innerHTML += msg + '<br>';
+            debug.scrollTop = debug.scrollHeight;
+            console.log(msg);
+        }
+
+        log('Page loaded. Fetching graph data...');
+
+        // ── Fetch graph data ──
+        fetch('/api/graph')
+            .then(res => {
+                if (res.status === 404) {
+                    // No graph data yet – show instruction
+                    document.getElementById('errorMsg').innerText = 
+                        'No road network data found. Please upload a satellite image to get started.';
+                    return Promise.reject('No data');
+                }
+                if (!res.ok) {
+                    return res.json().then(err => { throw new Error(err.error || `HTTP ${res.status}`); });
+                }
+                return res.json();
+            })
+            .then(data => {
+                graphData = data;
+                log(`✅ Graph data loaded: ${Object.keys(data.nodes).length} nodes, ${data.edges.length} edges`);
+                initMap(data);
+                populateDropdowns(data);
+            })
+            .catch(err => {
+                if (err !== 'No data') {
+                    document.getElementById('errorMsg').innerText = '❌ ' + err.message;
+                    log('❌ ' + err.message);
+                    console.error(err);
+                }
+            });
+
+        // ── Upload functionality ──
+        document.getElementById('uploadBtn').addEventListener('click', function() {
+            const fileInput = document.getElementById('fileInput');
+            const statusDiv = document.getElementById('uploadStatus');
+            if (fileInput.files.length === 0) {
+                statusDiv.innerText = 'Please select a file.';
+                return;
+            }
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+            statusDiv.innerText = '⏳ Uploading and processing... (may take 10-20s)';
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.error) {
+                    statusDiv.innerText = '❌ Error: ' + data.error;
+                } else {
+                    statusDiv.innerText = '✅ Success! Reloading page...';
+                    setTimeout(() => window.location.reload(), 1000);
+                }
+            })
+            .catch(err => {
+                statusDiv.innerText = '❌ Request failed: ' + err;
+            });
+        });
+
+        function initMap(data) {
+            log('Initializing map...');
+            const h = data.image_shape[0], w = data.image_shape[1];
+            const mapDiv = document.getElementById('map');
+            if (!mapDiv) {
+                log('❌ Map container not found!');
+                return;
+            }
+            log(`Map container: ${mapDiv.clientWidth}x${mapDiv.clientHeight}`);
+
+            // Create map with Simple CRS
+            map = L.map('map', { crs: L.CRS.Simple }).setView([-h/2, w/2], 10);
+            const bounds = [[-h, 0], [0, w]];
+            map.fitBounds(bounds);
+
+            // ── 1. Add background images ──
+            const satUrl = '/static/sat.jpg';
+            const maskUrl = '/static/mask.png';
+
+            satOverlay = L.imageOverlay(satUrl, bounds, { opacity: 0.7, interactive: false })
+                .addTo(map)
+                .on('load', () => log('✅ Satellite image loaded.'))
+                .on('error', () => log('⚠️ Satellite image not found.'));
+
+            maskOverlay = L.imageOverlay(maskUrl, bounds, { opacity: 0, interactive: false })
+                .on('load', () => log('✅ Mask image loaded.'))
+                .on('error', () => log('⚠️ Mask image not found.'));
+
+            // Mask starts hidden, satellite visible
+            satOverlay.setOpacity(0.7);
+            maskOverlay.setOpacity(0);
+
+            // ── 2. Edge betweenness ──
+            const edgeBC = data.edge_bc;
+            const values = Object.values(edgeBC);
+            const minBC = values.length ? Math.min(...values) : 0;
+            const maxBC = values.length ? Math.max(...values) : 1;
+            log(`Edge BC range: ${minBC.toFixed(4)} – ${maxBC.toFixed(4)}`);
+
+            function getColor(score) {
+                if (maxBC === minBC) return '#0066cc';
+                const norm = (score - minBC) / (maxBC - minBC);
+                const r = Math.round(255 * norm);
+                const b = Math.round(255 * (1 - norm));
+                return `rgb(${r}, 0, ${b})`;
+            }
+
+            // ── 3. Draw edges ──
+            let edgeCount = 0;
+            for (const [u, v, wm] of data.edges) {
+                const p1 = data.nodes[u], p2 = data.nodes[v];
+                if (!p1 || !p2) continue;
+                const coords = [[-p1.r, p1.c], [-p2.r, p2.c]];
+                const key = `${u}-${v}`;
+                const bcVal = edgeBC[key] || 0;
+                const color = getColor(bcVal);
+                const poly = L.polyline(coords, {
+                    color: color,
+                    weight: 4,
+                    opacity: 0.8,
+                    popup: `Edge ${u}-${v}<br>BC: ${bcVal.toFixed(4)}<br>Length: ${wm.toFixed(1)}m`
+                });
+                poly._weight_m = wm;
+                poly._label = `${u}-${v}`;
+                poly._origColor = color;
+                edgeGroup.addLayer(poly);
+                edgeCount++;
+            }
+            log(`✅ ${edgeCount} edges drawn.`);
+            edgeGroup.addTo(map);
+
+            // ── 4. Draw nodes ──
+            let nodeCount = 0;
+            for (const [id, nd] of Object.entries(data.nodes)) {
+                const bcScore = data.bc[id] || 0;
+                const resScore = data.resilience[id] !== undefined ? data.resilience[id] : 'N/A';
+                const marker = L.circleMarker([-nd.r, nd.c], {
+                    radius: 6,
+                    color: '#000',
+                    weight: 1.5,
+                    fillColor: '#fff',
+                    fillOpacity: 0.9
+                })
+                .bindPopup(`
+                    <b>${nd.label}</b><br>
+                    BC: ${bcScore.toFixed(4)}<br>
+                    Resilience: ${resScore}
+                `);
+                marker._nodeId = id;
+                marker._label = nd.label;
+                marker._bc = bcScore;
+                marker._res = resScore;
+                nodeGroup.addLayer(marker);
+                nodeCount++;
+            }
+            log(`✅ ${nodeCount} nodes drawn.`);
+            nodeGroup.addTo(map);
+
+            // ── 5. Label layers ──
+            labelGroup.addTo(map);
+            edgeLabelGroup.addTo(map);
+
+            // ── 6. Toggle control (bottom-right) ──
+            const control = L.control({ position: 'bottomright' });
+            control.onAdd = function() {
+                const div = L.DomUtil.create('div', 'legend');
+                div.innerHTML = `
+                    <div style="margin-bottom:8px;"><strong>Map Layers</strong></div>
+                    <label><input type="checkbox" id="chkHeatmap" checked> Heatmap (edge BC)</label>
+                    <label><input type="checkbox" id="chkNodeBC" checked> Node BC values</label>
+                    <label><input type="checkbox" id="chkResilience" checked> Resilience values</label>
+                    <label><input type="checkbox" id="chkEdgeWeight"> Edge weights</label>
+                    <hr>
+                    <label><input type="checkbox" id="chkMask"> Show mask overlay</label>
+                    <hr>
+                    <div>
+                        <span class="color-bar" style="background:red;"></span> High BC
+                        <span class="color-bar" style="background:blue; margin-left:10px;"></span> Low BC
+                    </div>
+                `;
+                return div;
+            };
+            control.addTo(map);
+
+            // ── 7. Global change listener for all toggles ──
+            document.addEventListener('change', function(e) {
+                const target = e.target;
+                const id = target.id;
+
+                // Heatmap toggle
+                if (id === 'chkHeatmap') {
+                    const show = target.checked;
+                    edgeGroup.eachLayer(function(layer) {
+                        if (show) {
+                            layer.setStyle({ color: layer._origColor || '#0066cc', opacity: 0.8 });
+                        } else {
+                            layer.setStyle({ color: '#999', opacity: 0.5 });
+                        }
+                    });
+                }
+
+                // Node BC / Resilience toggles
+                if (id === 'chkNodeBC' || id === 'chkResilience') {
+                    updateNodeLabels();
+                }
+
+                // Edge weight toggle
+                if (id === 'chkEdgeWeight') {
+                    updateEdgeLabels();
+                }
+
+                // Mask toggle (FIXED: now inside the global listener)
+                if (id === 'chkMask') {
+                    const showMask = target.checked;
+                    log(`Mask toggle: ${showMask ? 'ON' : 'OFF'}`);
+                    if (showMask) {
+                        satOverlay.setOpacity(0);
+                        maskOverlay.setOpacity(0.7);
+                    } else {
+                        satOverlay.setOpacity(0.7);
+                        maskOverlay.setOpacity(0);
+                    }
+                }
+            });
+
+            // ── 8. Functions to update labels ──
+            function updateNodeLabels() {
+                labelGroup.clearLayers();
+                const showBC = document.getElementById('chkNodeBC').checked;
+                const showRes = document.getElementById('chkResilience').checked;
+                nodeGroup.eachLayer(function(marker) {
+                    const label = marker._label;
+                    const bc = marker._bc;
+                    const res = marker._res;
+                    let text = label;
+                    if (showBC) text += `<br>BC: ${bc.toFixed(3)}`;
+                    if (showRes) text += `<br>R: ${res}`;
+                    const icon = L.divIcon({
+                        className: 'node-label',
+                        html: text,
+                        iconSize: [60, 30],
+                        iconAnchor: [30, 15]
+                    });
+                    const pos = marker.getLatLng();
+                    const labelMarker = L.marker(pos, { icon: icon, interactive: false });
+                    labelGroup.addLayer(labelMarker);
+                });
+            }
+
+            function updateEdgeLabels() {
+                edgeLabelGroup.clearLayers();
+                const show = document.getElementById('chkEdgeWeight').checked;
+                if (!show) return;
+                edgeGroup.eachLayer(function(poly) {
+                    const wm = poly._weight_m;
+                    if (!wm) return;
+                    const latlngs = poly.getLatLngs();
+                    if (latlngs.length < 2) return;
+                    const mid = L.latLng(
+                        (latlngs[0].lat + latlngs[1].lat)/2,
+                        (latlngs[0].lng + latlngs[1].lng)/2
+                    );
+                    const icon = L.divIcon({
+                        className: 'edge-weight',
+                        html: `${wm.toFixed(0)}m`,
+                        iconSize: [30, 16],
+                        iconAnchor: [15, 8]
+                    });
+                    const labelMarker = L.marker(mid, { icon: icon, interactive: false });
+                    edgeLabelGroup.addLayer(labelMarker);
+                });
+            }
+
+            // Initial label update
+            setTimeout(() => {
+                updateNodeLabels();
+                document.getElementById('chkEdgeWeight').checked = false;
+                updateEdgeLabels();
+            }, 200);
+
+            log('Map initialization complete.');
+        }
+
+        function populateDropdowns(data) {
+            log('Populating dropdowns...');
+            const labels = {};
+            for (const [id, nd] of Object.entries(data.nodes)) {
+                labels[id] = nd.label;
+            }
+            const sortedIds = Object.keys(labels).sort((a,b) => labels[a].localeCompare(labels[b]));
+
+            const startSel = document.getElementById('startSelect');
+            const endSel = document.getElementById('endSelect');
+            const closedSel = document.getElementById('closedSelect');
+
+            sortedIds.forEach(id => {
+                const label = labels[id];
+                [startSel, endSel, closedSel].forEach(sel => {
+                    const opt = document.createElement('option');
+                    opt.value = label;
+                    opt.text = label;
+                    sel.appendChild(opt);
+                });
+            });
+            log(`✅ ${sortedIds.length} labels populated.`);
+        }
+
+        // ── Simulation ──
+        document.getElementById('simulateBtn').addEventListener('click', function() {
+            const start = document.getElementById('startSelect').value;
+            const end = document.getElementById('endSelect').value;
+            const closedSelect = document.getElementById('closedSelect');
+            const closed = Array.from(closedSelect.selectedOptions).map(opt => opt.value);
+
+            if (routeLayer) {
+                map.removeLayer(routeLayer);
+                routeLayer = null;
+            }
+            document.getElementById('metrics').innerHTML = '';
+            document.getElementById('errorMsg').innerText = '';
+            log(`Simulate: Start=${start}, End=${end}, Closed=${closed.join(', ')}`);
+
+            fetch('/api/route', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ start, end, closed })
+            })
+            .then(res => res.json())
+            .then(result => {
+                if (result.error) {
+                    document.getElementById('errorMsg').innerText = 'Error: ' + result.error;
+                    log('❌ ' + result.error);
+                    return;
+                }
+                const pathIds = result.path;
+                log(`✅ Path found: ${pathIds.length} nodes`);
+                const coords = pathIds.map(id => {
+                    const nd = graphData.nodes[id];
+                    if (!nd) return null;
+                    return [-nd.r, nd.c];
+                }).filter(c => c !== null);
+
+                routeLayer = L.polyline(coords, {
+                    color: 'yellow',
+                    weight: 8,
+                    opacity: 0.9,
+                    popup: `Reroute length: ${result.length.toFixed(1)}m`
+                }).addTo(map);
+
+                const base = result.default_length;
+                const detour = result.length - base;
+                const pct = base ? ((detour/base)*100).toFixed(1) : 'N/A';
+                document.getElementById('metrics').innerHTML = `
+                    <div class="metric">Reroute length: <span>${result.length.toFixed(1)} m</span></div>
+                    <div class="metric">Default length: <span>${base ? base.toFixed(1) : 'N/A'} m</span></div>
+                    <div class="metric">Detour: <span>${detour.toFixed(1)} m (${pct}%)</span></div>
+                `;
+                log(`Metrics displayed.`);
+            })
+            .catch(err => {
+                document.getElementById('errorMsg').innerText = 'Request failed: ' + err;
+                log('❌ ' + err);
+            });
+        });
+    </script>
+</body>
+</html>

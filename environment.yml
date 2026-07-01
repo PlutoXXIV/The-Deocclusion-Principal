@@ -1,0 +1,24 @@
+name: bah
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - scikit-image
+  - networkx
+  - matplotlib
+  - numpy
+  - ipykernel
+  - opencv
+  - pandas
+  - openpyxl
+  - scikit-learn
+  - tqdm
+  - scipy
+  - albumentations
+  - pytorch-cuda=12.4
+  - flask-cors
+  - flask
+  - simsimd
+  - stringzilla
+prefix: /home/dharm/miniconda3/envs/bah
