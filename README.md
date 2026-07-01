@@ -1,4 +1,4 @@
-## Directions to Run this
+## Directions to Run this
 
 Using conda, clone my environment using the environment.yml file
 
